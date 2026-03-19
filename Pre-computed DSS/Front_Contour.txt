@@ -1,0 +1,1276 @@
+// src/App.js
+import React, { useEffect, useMemo, useState } from "react";
+import { MapContainer, TileLayer, Marker, useMapEvents } from "react-leaflet";
+import "leaflet/dist/leaflet.css";
+import L from "leaflet";
+import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
+import markerIcon from "leaflet/dist/images/marker-icon.png";
+import markerShadow from "leaflet/dist/images/marker-shadow.png";
+import {
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  ReferenceLine
+} from "recharts";
+
+/* ---------------- Leaflet marker fix ---------------- */
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: markerIcon2x,
+  iconUrl: markerIcon,
+  shadowUrl: markerShadow,
+});
+
+/* ---------------- Backend / ngrok ---------------- */
+const API_BASE = "******************";
+const NGROK_HEADER = { "ngrok-skip-browser-warning": "true" };
+const withNgrokParam = (path) =>
+  `${API_BASE}${path}${path.includes("?") ? "&" : "?"}ngrok-skip-browser-warning=true`;
+
+/* ---------------- Helpers ---------------- */
+const getLastNYears = (n) => {
+  const currentYear = new Date().getFullYear();
+  return Array.from({ length: n }, (_, i) => currentYear - n + 1 + i);
+};
+const years = getLastNYears(10);
+
+const fmt = (v, suf = "") => (Number.isFinite(v) ? `${Number(v).toFixed(2)}${suf}` : "—");
+const pf = (v) => {
+  const n = parseFloat((v ?? "").toString());
+  return Number.isFinite(n) ? n : NaN;
+};
+const money = (v) => (Number.isFinite(+v) ? `$${Number(v).toFixed(0)}/ha` : "—");
+const hhmmss = (ts) =>
+  new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+
+/* --- Compare cache config --- */
+const INACTIVITY_MS = 5 * 60 * 1000;
+const MAX_RUNS = 8;
+const RUN_COLORS = ["#2563eb", "#16a34a", "#dc2626", "#7c3aed", "#ea580c", "#0ea5e9", "#f43f5e", "#22c55e"];
+
+/* --- UI constants --- */
+const BOX_GAP = 32;
+const cardStyle = { border: "1px dashed #ccc", padding: "12px", borderRadius: 8, background: "#fff" };
+const chip = (bg = "#eef2ff", color = "#1f2937") => ({
+  display: "inline-block",
+  padding: "2px 8px",
+  borderRadius: 999,
+  background: bg,
+  color,
+  fontSize: 12,
+  border: "1px solid #e5e7eb"
+});
+
+const NrcfTooltip = ({ active, payload, label }) => {
+  if (!active || !payload || !payload.length) return null;
+
+  return (
+    <div
+      style={{
+        background: "#fff",
+        border: "1px solid #e5e7eb",
+        borderRadius: 8,
+        padding: "8px 10px",
+        boxShadow: "0 4px 12px rgba(0,0,0,0.08)"
+      }}
+    >
+      <div style={{ fontWeight: 600, marginBottom: 6 }}>
+        Nitrogen Rate = {label} kg/ha
+      </div>
+      {payload.map((p, i) => (
+        <div key={i} style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 2 }}>
+          <span
+            style={{
+              width: 10,
+              height: 10,
+              borderRadius: 999,
+              background: p.color,
+              display: "inline-block"
+            }}
+          />
+          <span style={{ fontSize: 12 }}>{p.name}</span>
+          <span style={{ marginLeft: "auto", fontFeatureSettings: "'tnum' 1" }}>
+            {money(p.value)}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+};
+
+const App = () => {
+  const [latitude, setLatitude] = useState(45.5017);
+  const [longitude, setLongitude] = useState(-73.5673);
+  const [selectedLocation, setSelectedLocation] = useState([45.5017, -73.5673]);
+
+  // sliders (continuous)
+  const [sliderValue1, setSliderValue1] = useState(null); // ACLAY
+  const [sliderValue2, setSliderValue2] = useState(null); // SOM
+  const [sliderValue3, setSliderValue3] = useState(null); // CHU
+  const [sliderValue4, setSliderValue4] = useState(null); // AWDR
+
+  // categoricals
+  const [previousCrop, setPreviousCrop] = useState("Low nutrient");
+  const [previousCropValue, setPreviousCropValue] = useState(0);
+  const [tillageType, setTillageType] = useState("No till");
+  const [tillageTypeValue, setTillageTypeValue] = useState(0);
+
+  // q / misc
+  const [q, setQ] = useState(1);
+  const [results, setResults] = useState(null);
+  const [email, setEmail] = useState("");
+
+  const [fertilizer, setFertilizer] = useState("Nitrogen");
+  const [crop, setCrop] = useState("corn");
+  const [season, setSeason] = useState(years[years.length - 1]);
+
+  const [loading, setLoading] = useState(false);
+  const [loadingSeconds, setLoadingSeconds] = useState(0);
+  const [hasSubmitted, setHasSubmitted] = useState(false);
+  const [ranges, setRanges] = useState(null);
+
+  // prices & target N (display / custom card only)
+  const [cornMu, setCornMu] = useState(0);
+  const [cornSigma, setCornSigma] = useState(0);
+  const [ureaMu, setUreaMu] = useState(0);
+  const [ureaSigma, setUreaSigma] = useState(0);
+  const [targetN, setTargetN] = useState("");
+
+  // compare cache
+  const [runs, setRuns] = useState([]);
+  const [lastActive, setLastActive] = useState(Date.now());
+
+  // contour modal
+  const [showContourModal, setShowContourModal] = useState(false);
+  const [zoomedContour, setZoomedContour] = useState(null);
+
+  /* ---------- contour modal handlers ---------- */
+  const openContourModal = (base64) => {
+    setZoomedContour(base64);
+    setShowContourModal(true);
+  };
+
+  const closeContourModal = () => {
+    setShowContourModal(false);
+    setZoomedContour(null);
+  };
+
+  /* ---------- ranges ---------- */
+  useEffect(() => {
+    (async () => {
+      try {
+        const url = withNgrokParam("/feature_ranges/");
+        const res = await fetch(url, {
+          headers: { ...NGROK_HEADER, Accept: "application/json" }
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const raw = Array.isArray(data) ? data[0] : data;
+
+        const parsed = {
+          ACLAY_min: pf(raw?.ACLAY_min),
+          ACLAY_max: pf(raw?.ACLAY_max),
+          SOM_min: pf(raw?.SOM_min),
+          SOM_max: pf(raw?.SOM_max),
+          CHU_min: pf(raw?.CHU_min),
+          CHU_max: pf(raw?.CHU_max),
+          AWDR_min: pf(raw?.AWDR_min),
+          AWDR_max: pf(raw?.AWDR_max),
+        };
+        setRanges(parsed);
+
+        const mid = (a, b) => (Number.isFinite(a) && Number.isFinite(b) ? (a + b) / 2 : 0);
+        setSliderValue1(mid(parsed.ACLAY_min, parsed.ACLAY_max));
+        setSliderValue2(mid(parsed.SOM_min, parsed.SOM_max));
+        setSliderValue3(mid(parsed.CHU_min, parsed.CHU_max));
+        setSliderValue4(mid(parsed.AWDR_min, parsed.AWDR_max));
+      } catch (e) {
+        console.error("feature_ranges fetch error:", e);
+        setSliderValue1(50);
+        setSliderValue2(75);
+        setSliderValue3(25);
+        setSliderValue4(60);
+      }
+    })();
+  }, []);
+
+  /* ---------- loading timer ---------- */
+  useEffect(() => {
+    let interval;
+    if (loading) {
+      setLoadingSeconds(0);
+      interval = setInterval(() => setLoadingSeconds((p) => p + 1), 1000);
+    }
+    return () => clearInterval(interval);
+  }, [loading]);
+
+  /* ---------- restore cache ---------- */
+  useEffect(() => {
+    try {
+      const raw = sessionStorage.getItem("numericag_runs");
+      const ts = Number(sessionStorage.getItem("numericag_lastActive") || "0");
+      const now = Date.now();
+      if (raw && ts && now - ts < INACTIVITY_MS) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          setRuns(parsed);
+        }
+      } else {
+        sessionStorage.removeItem("numericag_runs");
+        sessionStorage.removeItem("numericag_lastActive");
+      }
+    } catch {}
+  }, []);
+
+  /* ---------- inactivity auto-clear ---------- */
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const now = Date.now();
+      const ts = Number(sessionStorage.getItem("numericag_lastActive") || String(lastActive));
+      if (now - ts >= INACTIVITY_MS) {
+        setRuns([]);
+        sessionStorage.removeItem("numericag_runs");
+        sessionStorage.removeItem("numericag_lastActive");
+      }
+    }, 30000);
+    return () => clearInterval(timer);
+  }, [lastActive]);
+
+  /* ---------- activity bump ---------- */
+  useEffect(() => {
+    const bump = () => {
+      const now = Date.now();
+      setLastActive(now);
+      sessionStorage.setItem("numericag_lastActive", String(now));
+    };
+    window.addEventListener("mousemove", bump);
+    window.addEventListener("keydown", bump);
+    window.addEventListener("click", bump);
+    return () => {
+      window.removeEventListener("mousemove", bump);
+      window.removeEventListener("keydown", bump);
+      window.removeEventListener("click", bump);
+    };
+  }, []);
+
+  /* ---------- close modal with Escape ---------- */
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if (e.key === "Escape") closeContourModal();
+    };
+
+    if (showContourModal) {
+      window.addEventListener("keydown", onKeyDown);
+      document.body.style.overflow = "hidden";
+    }
+
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      document.body.style.overflow = "";
+    };
+  }, [showContourModal]);
+
+  /* ---------- map click ---------- */
+  const LocationMarker = () => {
+    useMapEvents({
+      click(e) {
+        const { lat, lng } = e.latlng;
+        setLatitude(lat);
+        setLongitude(lng);
+        setSelectedLocation([lat, lng]);
+      },
+    });
+    return <Marker position={selectedLocation} />;
+  };
+
+  /* ---------- manual inputs ---------- */
+  const handleLatChange = (e) => {
+    const newLat = parseFloat(e.target.value);
+    setLatitude(newLat);
+    setSelectedLocation([newLat, longitude]);
+  };
+
+  const handleLngChange = (e) => {
+    const newLng = parseFloat(e.target.value);
+    setLongitude(newLng);
+    setSelectedLocation([latitude, newLng]);
+  };
+
+  /* ---------- cache ops ---------- */
+  const addRunToCache = (payload, profitResults, backendResult) => {
+    const best = profitResults.reduce((m, r) => (r.efb > m.efb ? r : m), profitResults[0]);
+    const run = {
+      id: `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      ts: Date.now(),
+      inputs: payload,
+      profit_results: profitResults,
+      eonr: backendResult?.eonr ?? best?.n_rate ?? null,
+      contour_chart_base64: backendResult?.contour_chart_base64 ?? null,
+      contour_data: backendResult?.contour_data ?? null,
+      similarity: backendResult?.similarity ?? null,
+      matched_bin_key: backendResult?.matched_bin_key ?? null,
+      used_fallback: backendResult?.used_fallback ?? false,
+      fallback_distance: backendResult?.fallback_distance ?? null
+    };
+
+    setRuns((prev) => {
+      const next = [run, ...prev].slice(0, MAX_RUNS);
+      sessionStorage.setItem("numericag_runs", JSON.stringify(next));
+      sessionStorage.setItem("numericag_lastActive", String(Date.now()));
+      return next;
+    });
+  };
+
+  const clearAllRuns = () => {
+    setRuns([]);
+    sessionStorage.removeItem("numericag_runs");
+    sessionStorage.removeItem("numericag_lastActive");
+  };
+
+  const removeRun = (id) => {
+    setRuns((prev) => {
+      const next = prev.filter((r) => r.id !== id);
+      sessionStorage.setItem("numericag_runs", JSON.stringify(next));
+      sessionStorage.setItem("numericag_lastActive", String(Date.now()));
+      return next;
+    });
+  };
+
+  /* ---------- submit ---------- */
+  const handleSubmit = async () => {
+    setHasSubmitted(true);
+    const payload = {
+      lati: latitude,
+      longti: longitude,
+      CHU: Number(sliderValue3),
+      AWDR: Number(sliderValue4),
+      ACLAY: Number(sliderValue1),
+      SOM: Number(sliderValue2),
+      PREV: previousCrop,
+      PREV_VALUE: previousCropValue,
+      TILLAGE: tillageType,
+      TILLAGE_VALUE: tillageTypeValue,
+      q,
+      Fertilizer: fertilizer,
+      Crop: crop,
+      Season: season,
+      email,
+      yieldPriceMean: Number(cornMu || 0),
+      yieldPriceStdDev: Number(cornSigma || 0),
+      fertilizerCostMean: Number(ureaMu || 0),
+      fertilizerCostStdDev: Number(ureaSigma || 0),
+    };
+
+    setLoading(true);
+    try {
+      const url = withNgrokParam("/calculate_similarity/");
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          ...NGROK_HEADER,
+          "Content-Type": "application/json",
+          Accept: "application/json"
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status} ${txt}`);
+      }
+
+      const data = await res.json();
+      setResults(data);
+
+      if (Array.isArray(data?.profit_results) && data.profit_results.length) {
+        addRunToCache(payload, data.profit_results, data);
+      }
+    } catch (error) {
+      console.error("calculate_similarity fetch error:", error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  /* ---------- Custom Profit (client-side) ---------- */
+  const qpLocal = (N, Y0, Ymax, Nymax) => {
+    const b = (2 * (Ymax - Y0)) / Nymax;
+    const c = (Y0 - Ymax) / (Nymax ** 2);
+    return N <= Nymax ? (Y0 + b * N + c * (N ** 2)) : Ymax;
+  };
+
+  const customCard = useMemo(() => {
+    if (!results?.qp_params) return null;
+    if (targetN === "" || !Number.isFinite(+targetN)) return null;
+
+    const { Y0, Ymax, Nymax } = results.qp_params;
+    const N = Number(targetN);
+    const price = Number(cornMu || results?.used_prices?.yield_mean || 0);
+    const cost = Number(ureaMu || results?.used_prices?.fert_mean || 0);
+
+    if (!(Number.isFinite(price) && Number.isFinite(cost))) return null;
+
+    const yld = qpLocal(N, Y0, Ymax, Nymax);
+    const nrcf = yld * price - N * cost;
+    return { N, yld, price, cost, nrcf };
+  }, [results, targetN, cornMu, ureaMu]);
+
+  return (
+    <>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "20px", height: "100vh" }}>
+        {/* Left column */}
+        <div style={{ backgroundColor: "#f0f0f0", padding: "10px" }}>
+          <div>
+            <img src={require("./lablogo.png")} alt="Lab Logo" style={{ width: "150px" }} />
+          </div>
+
+          <div style={{ margin: "20px 0" }}>
+            <iframe
+              width="100%"
+              height="315"
+              src="https://www.youtube.com/embed/sSiekr0XWUI"
+              title="YouTube video player"
+              frameBorder="0"
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+              allowFullScreen
+            />
+          </div>
+
+          <MapContainer center={selectedLocation} zoom={13} style={{ height: "300px", width: "100%" }}>
+            <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+            <LocationMarker />
+          </MapContainer>
+
+          <div style={{ marginTop: "10px" }}>
+            <div style={{ marginBottom: "20px" }}>
+              <label>Your Latitude</label>
+              <input
+                type="number"
+                value={latitude}
+                onChange={handleLatChange}
+                style={{ width: "100%", marginBottom: "10px" }}
+              />
+            </div>
+
+            <div style={{ marginBottom: "20px" }}>
+              <label>Your Longitude</label>
+              <input
+                type="number"
+                value={longitude}
+                onChange={handleLngChange}
+                style={{ width: "100%", marginBottom: "10px" }}
+              />
+            </div>
+
+            <div style={{ marginBottom: "20px" }}>
+              <label>Fertilizer</label>
+              <select
+                value={fertilizer}
+                onChange={(e) => setFertilizer(e.target.value)}
+                style={{ width: "100%", marginBottom: "10px" }}
+              >
+                <option value="Nitrogen">Nitrogen</option>
+              </select>
+            </div>
+
+            <div style={{ marginBottom: "20px" }}>
+              <label>Crop</label>
+              <select
+                value={crop}
+                onChange={(e) => setCrop(e.target.value)}
+                style={{ width: "100%", marginBottom: "10px" }}
+              >
+                <option value="corn">Corn</option>
+              </select>
+            </div>
+
+            <div style={{ marginBottom: "20px" }}>
+              <label>Growing Season</label>
+              <select
+                value={season}
+                onChange={(e) => setSeason(parseInt(e.target.value, 10))}
+                style={{ width: "100%", marginBottom: "10px" }}
+              >
+                {years.map((year) => (
+                  <option key={year} value={year}>
+                    {year}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+        </div>
+
+        {/* Middle column */}
+        <div style={{ padding: "10px", display: "flex", flexDirection: "column", gap: BOX_GAP }}>
+          <div style={cardStyle}>
+            <label>Previous Crop</label>
+            <select
+              name="previousCrop"
+              value={previousCrop}
+              onChange={(e) => {
+                const v = e.target.value;
+                setPreviousCrop(v);
+                if (v === "Low nutrient") setPreviousCropValue(0);
+                else if (v === "Moderate nutrient") setPreviousCropValue(1);
+                else setPreviousCropValue(2);
+              }}
+              style={{ width: "100%", marginBottom: "10px" }}
+            >
+              <option value="Low nutrient">Low nutrient</option>
+              <option value="Moderate nutrient">Moderate nutrient</option>
+              <option value="High nutrient">High nutrient</option>
+            </select>
+
+            <label>Relative Value (0-2): {fmt(previousCropValue)}</label>
+            <div style={{ display: "flex", justifyContent: "space-between", margin: "10px 0" }}>
+              <span>0</span>
+              <span>1</span>
+              <span>2</span>
+            </div>
+
+            <input
+              type="range"
+              min="0"
+              max="2"
+              step="0.01"
+              value={Number.isFinite(previousCropValue) ? previousCropValue : 0}
+              onChange={(e) => {
+                const newValue = parseFloat(e.target.value);
+                setPreviousCropValue(newValue);
+                if (newValue < 0.5) setPreviousCrop("Low nutrient");
+                else if (newValue < 1.5) setPreviousCrop("Moderate nutrient");
+                else setPreviousCrop("High nutrient");
+              }}
+              style={{ width: "100%" }}
+            />
+          </div>
+
+          <div style={cardStyle}>
+            <label>Type of Tillage</label>
+            <select
+              name="tillageType"
+              value={tillageType}
+              onChange={(e) => {
+                const t = e.target.value;
+                setTillageType(t);
+                setTillageTypeValue(t === "No till" ? 0 : 1);
+              }}
+              style={{ width: "100%", marginBottom: "10px" }}
+            >
+              <option value="No till">No till</option>
+              <option value="Conventionnel">Conventional</option>
+            </select>
+
+            <label>Relative Value (0-1): {fmt(tillageTypeValue)}</label>
+            <div style={{ display: "flex", justifyContent: "space-between", margin: "10px 0" }}>
+              <span>0</span>
+              <span>1</span>
+            </div>
+
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.01"
+              value={Number.isFinite(tillageTypeValue) ? tillageTypeValue : 0}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value);
+                setTillageTypeValue(v);
+                setTillageType(v < 0.5 ? "No till" : "Conventionnel");
+              }}
+              style={{ width: "100%" }}
+            />
+          </div>
+
+          <div style={cardStyle}>
+            <label>
+              ACLAY: {fmt(sliderValue1, "%")}
+              {ranges && <> &nbsp; <small>(min {fmt(ranges.ACLAY_min)}, max {fmt(ranges.ACLAY_max)})</small></>}
+            </label>
+            <input
+              type="range"
+              min={Number.isFinite(ranges?.ACLAY_min) ? ranges.ACLAY_min : 0}
+              max={Number.isFinite(ranges?.ACLAY_max) ? ranges.ACLAY_max : 100}
+              step="0.01"
+              value={Number.isFinite(sliderValue1) ? sliderValue1 : 0}
+              onChange={(e) => setSliderValue1(parseFloat(e.target.value))}
+              style={{ width: "100%" }}
+            />
+            <input
+              type="number"
+              value={Number.isFinite(sliderValue1) ? sliderValue1 : ""}
+              onChange={(e) => setSliderValue1(parseFloat(e.target.value))}
+              style={{ width: "100%", marginTop: "10px" }}
+            />
+
+            <label>
+              SOM: {fmt(sliderValue2, "%")}
+              {ranges && <> &nbsp; <small>(min {fmt(ranges.SOM_min)}, max {fmt(ranges.SOM_max)})</small></>}
+            </label>
+            <input
+              type="range"
+              min={Number.isFinite(ranges?.SOM_min) ? ranges.SOM_min : 0}
+              max={Number.isFinite(ranges?.SOM_max) ? ranges.SOM_max : 10}
+              step="0.01"
+              value={Number.isFinite(sliderValue2) ? sliderValue2 : 0}
+              onChange={(e) => setSliderValue2(parseFloat(e.target.value))}
+              style={{ width: "100%" }}
+            />
+            <input
+              type="number"
+              value={Number.isFinite(sliderValue2) ? sliderValue2 : ""}
+              onChange={(e) => setSliderValue2(parseFloat(e.target.value))}
+              style={{ width: "100%", marginTop: "10px" }}
+            />
+
+            <label>
+              CHU: {fmt(sliderValue3)}
+              {ranges && <> &nbsp; <small>(min {fmt(ranges.CHU_min)}, max {fmt(ranges.CHU_max)})</small></>}
+            </label>
+            <input
+              type="range"
+              min={Number.isFinite(ranges?.CHU_min) ? ranges.CHU_min : 500}
+              max={Number.isFinite(ranges?.CHU_max) ? ranges.CHU_max : 1200}
+              step="1"
+              value={Number.isFinite(sliderValue3) ? sliderValue3 : 0}
+              onChange={(e) => setSliderValue3(parseFloat(e.target.value))}
+              style={{ width: "100%" }}
+            />
+            <input
+              type="number"
+              value={Number.isFinite(sliderValue3) ? sliderValue3 : ""}
+              onChange={(e) => setSliderValue3(parseFloat(e.target.value))}
+              style={{ width: "100%", marginTop: "10px" }}
+            />
+
+            <label>
+              AWDR: {fmt(sliderValue4)}
+              {ranges && <> &nbsp; <small>(min {fmt(ranges.AWDR_min)}, max {fmt(ranges.AWDR_max)})</small></>}
+            </label>
+            <input
+              type="range"
+              min={Number.isFinite(ranges?.AWDR_min) ? ranges.AWDR_min : 0}
+              max={Number.isFinite(ranges?.AWDR_max) ? ranges.AWDR_max : 150}
+              step="1"
+              value={Number.isFinite(sliderValue4) ? sliderValue4 : 0}
+              onChange={(e) => setSliderValue4(parseFloat(e.target.value))}
+              style={{ width: "100%" }}
+            />
+            <input
+              type="number"
+              value={Number.isFinite(sliderValue4) ? sliderValue4 : ""}
+              onChange={(e) => setSliderValue4(parseFloat(e.target.value))}
+              style={{ width: "100%", marginTop: "10px" }}
+            />
+          </div>
+
+          <div style={cardStyle}>
+            <h3 style={{ marginTop: 0 }}>Prices &amp; Target N</h3>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <div>
+                <label>Corn price μ (leave 0 = use default)</label>
+                <input
+                  type="number"
+                  value={cornMu}
+                  onChange={(e) => setCornMu(pf(e.target.value))}
+                  style={{ width: "100%" }}
+                />
+              </div>
+              <div>
+                <label>Corn price σ (leave 0 = default)</label>
+                <input
+                  type="number"
+                  value={cornSigma}
+                  onChange={(e) => setCornSigma(pf(e.target.value))}
+                  style={{ width: "100%" }}
+                />
+              </div>
+              <div>
+                <label>Urea cost μ (leave 0 = default)</label>
+                <input
+                  type="number"
+                  value={ureaMu}
+                  onChange={(e) => setUreaMu(pf(e.target.value))}
+                  style={{ width: "100%" }}
+                />
+              </div>
+              <div>
+                <label>Urea cost σ (leave 0 = default)</label>
+                <input
+                  type="number"
+                  value={ureaSigma}
+                  onChange={(e) => setUreaSigma(pf(e.target.value))}
+                  style={{ width: "100%" }}
+                />
+              </div>
+            </div>
+
+            <div style={{ marginTop: 10 }}>
+              <label>Target N (kg/ha)</label>
+              <input
+                type="range"
+                min={0}
+                max={260}
+                step={10}
+                value={targetN === "" ? 0 : Number(targetN)}
+                onChange={(e) =>
+                  setTargetN(e.target.value === "0" && targetN === "" ? "" : parseInt(e.target.value, 10))
+                }
+                style={{ width: "100%" }}
+              />
+              <input
+                type="number"
+                placeholder="(optional)"
+                value={targetN}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "") setTargetN("");
+                  else setTargetN(parseInt(v, 10));
+                }}
+                style={{ width: "100%", marginTop: 8 }}
+              />
+            </div>
+
+            <p style={{ marginTop: 10, fontSize: 12, opacity: 0.8 }}>
+              Baseline charts and tables come from <b>pre-computed</b> results. Entering prices or Target N only adds a{" "}
+              <b>Custom Profit</b> card and highlights the row in the table; baseline results remain unchanged.
+            </p>
+          </div>
+
+          <div style={cardStyle}>
+            <div style={{ marginBottom: "20px" }}>
+              <label>Your Email</label>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="Enter your email"
+                style={{ width: "100%", marginBottom: "10px" }}
+              />
+            </div>
+
+            <div style={{ marginBottom: "20px" }}>
+              <label>Q</label>
+              <select value={q} onChange={(e) => setQ(parseInt(e.target.value, 10))} style={{ width: "100%" }}>
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="5">5</option>
+              </select>
+            </div>
+
+            <SelectedInputsCard
+              inline
+              latitude={latitude}
+              longitude={longitude}
+              ACLAY={sliderValue1}
+              SOM={sliderValue2}
+              CHU={sliderValue3}
+              AWDR={sliderValue4}
+              previousCrop={previousCrop}
+              tillageType={tillageType}
+              q={q}
+            />
+
+            <button onClick={handleSubmit} style={{ width: "100%" }} disabled={loading}>
+              {loading ? "Calculating…" : "Submit"}
+            </button>
+          </div>
+        </div>
+
+        {/* Right column */}
+        <div style={{ gridColumn: "3 / 4", overflowY: "auto", padding: "10px" }}>
+          {!loading && !results && !hasSubmitted && (
+            <div style={{ textAlign: "center", padding: "20px", lineHeight: "1.6" }}>
+              <h2>📊 Smart Fertilizer Decision Support</h2>
+              <p style={{ fontSize: "14px" }}>
+                Enter your field conditions and click <strong>Submit</strong> to see the economically optimal N rate.
+              </p>
+              <ul style={{ textAlign: "left", maxWidth: "320px", margin: "10px auto", fontSize: "13px" }}>
+                <li>Expected NRCF vs Nitrogen Rate comparison</li>
+                <li>Probability contour</li>
+                <li>Profit probability table</li>
+              </ul>
+            </div>
+          )}
+
+          {loading && (
+            <div style={{ textAlign: "center", padding: "40px" }}>
+              <div
+                style={{
+                  width: "48px",
+                  height: "48px",
+                  border: "6px solid #ccc",
+                  borderTop: "6px solid #007bff",
+                  borderRadius: "50%",
+                  animation: "spin 1s linear infinite",
+                  margin: "auto"
+                }}
+              />
+              <p style={{ fontSize: "16px", marginTop: "15px" }}>
+                Loading results... {loadingSeconds}s
+              </p>
+              <style>{`
+                @keyframes spin {
+                  0% { transform: rotate(0deg); }
+                  100% { transform: rotate(360deg); }
+                }
+              `}</style>
+            </div>
+          )}
+
+          {/* ---------- FIRST CHART: NRCF vs N rate ---------- */}
+          {runs.length > 0 && (
+            <div style={{ marginBottom: "30px" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                <h3 style={{ margin: 0 }}>Expected NRCF vs Nitrogen Rate</h3>
+                <button onClick={clearAllRuns} style={{ marginLeft: "auto" }}>
+                  Clear history
+                </button>
+              </div>
+
+              <div
+                style={{
+                  border: "1px solid #e5e7eb",
+                  borderRadius: 10,
+                  padding: 12,
+                  background: "#fff",
+                }}
+              >
+                <ResponsiveContainer width="100%" height={390}>
+                  <LineChart margin={{ top: 10, right: 20, left: 55, bottom: 55 }}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis
+                      type="number"
+                      dataKey="n_rate"
+                      domain={[0, 260]}
+                      tickCount={14}
+                      allowDuplicatedCategory={false}
+                      label={{
+                        value: "Nitrogen Rate (kg N/ha)",
+                        position: "bottom",
+                        offset: 25
+                      }}
+                    />
+                    <YAxis
+                      domain={["auto", "auto"]}
+                      label={{
+                        value: "Expected NRCF ($/ha)",
+                        angle: -90,
+                        position: "left",
+                        offset: 25
+                      }}
+                    />
+                    <Tooltip content={<NrcfTooltip />} />
+
+                    {runs.map((run, i) => (
+                      <React.Fragment key={run.id}>
+                        <Line
+                          type="monotone"
+                          data={run.profit_results}
+                          dataKey="expected_nrcf"
+                          name={`Run ${i + 1}`}
+                          stroke={RUN_COLORS[i % RUN_COLORS.length]}
+                          strokeWidth={2.5}
+                          dot={false}
+                          activeDot={{ r: 5 }}
+                          connectNulls
+                        />
+                        {run?.eonr !== null && run?.eonr !== undefined && (
+                          <ReferenceLine
+                            x={run.eonr}
+                            stroke={RUN_COLORS[i % RUN_COLORS.length]}
+                            strokeDasharray="6 4"
+                            ifOverflow="extendDomain"
+                          />
+                        )}
+                      </React.Fragment>
+                    ))}
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          )}
+
+          {runs.length > 0 && (
+            <div style={{ marginBottom: 16 }}>
+              <h3 style={{ marginBottom: 8 }}>Recent Runs</h3>
+              {runs.map((run, i) => (
+                <RunCard
+                  key={run.id}
+                  run={run}
+                  color={RUN_COLORS[i % RUN_COLORS.length]}
+                  onRemove={removeRun}
+                />
+              ))}
+            </div>
+          )}
+
+          {/* ---------- CONTOUR ---------- */}
+          {!loading && results?.contour_chart_base64 && (
+            <div style={{ marginBottom: "26px" }}>
+              <h3>Probability Contour</h3>
+
+              <div
+                style={{
+                  border: "1px solid #e5e7eb",
+                  borderRadius: 10,
+                  padding: 12,
+                  background: "#fff",
+                }}
+              >
+                <img
+                  src={`data:image/png;base64,${results.contour_chart_base64}`}
+                  alt="Probability Contour"
+                  onClick={() => openContourModal(results.contour_chart_base64)}
+                  style={{
+                    width: "100%",
+                    height: "auto",
+                    borderRadius: 8,
+                    display: "block",
+                    cursor: "zoom-in",
+                  }}
+                />
+
+                <div style={{ marginTop: 10, textAlign: "right" }}>
+                  <button
+                    onClick={() => openContourModal(results.contour_chart_base64)}
+                    style={{
+                      padding: "6px 12px",
+                      borderRadius: 6,
+                      border: "1px solid #d1d5db",
+                      background: "#fff",
+                      cursor: "pointer"
+                    }}
+                  >
+                    Enlarge contour
+                  </button>
+                </div>
+              </div>
+
+              {results?.eonr !== undefined && (
+                <p style={{ marginTop: 10, fontSize: 13 }}>
+                  <strong>⭐ Economically Optimum N Rate (EONR): {results.eonr} kg/ha</strong>
+                </p>
+              )}
+
+              {results?.used_fallback ? (
+                <p style={{ marginTop: 4, fontSize: 12, opacity: 0.85 }}>
+                  Fallback bin distance: <strong>{results?.fallback_distance ?? "—"}</strong>
+                </p>
+              ) : results?.similarity != null ? (
+                <p style={{ marginTop: 4, fontSize: 12, opacity: 0.85 }}>
+                  Scenario similarity: <strong>{Number(results.similarity).toFixed(4)}</strong>
+                </p>
+              ) : null}
+            </div>
+          )}
+
+          {!loading && results && (
+            <div>
+              <h2>Results</h2>
+              {Array.isArray(results.profit_results) && results.profit_results.length > 0 ? (() => {
+                const maxPoint = results.profit_results.reduce(
+                  (max, curr) => (curr.efb > max.efb ? curr : max),
+                  results.profit_results[0]
+                );
+                const maxEFB = maxPoint.efb;
+                const targetNNum = targetN === "" ? null : Number(targetN);
+
+                return (
+                  <>
+                    <div style={{ marginTop: "20px" }}>
+                      <h3>Expected Profit Results</h3>
+                      <div style={{ margin: "6px 0 10px 0" }}>
+                        <p style={{ margin: "0 0 4px 0" }}>
+                          <strong>⭐ Economically Optimum N Rate (EONR): {maxPoint.n_rate} kg/ha</strong>
+                        </p>
+                      </div>
+
+                      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "11px" }}>
+                        <thead>
+                          <tr>
+                            <th style={{ border: "1px solid #ccc", padding: "5px" }}>
+                              N rate<br />kg/ha
+                            </th>
+
+                            <th style={{ border: "1px solid #ccc", padding: "5px" }}>
+                              NRCF &gt; 1000<br />$/ha
+                            </th>
+
+                            <th style={{ border: "1px solid #ccc", padding: "5px" }}>
+                              NRCF &gt; 1500<br />$/ha
+                            </th>
+
+                            <th style={{ border: "1px solid #ccc", padding: "5px" }}>
+                              NRCF &gt; 2000<br />$/ha
+                            </th>
+
+                            <th style={{ border: "1px solid #ccc", padding: "5px" }}>
+                              NRCF &gt; 2500<br />$/ha
+                            </th>
+
+                            <th style={{ border: "1px solid #ccc", padding: "5px" }}>
+                              Expected NRCF<br />$/ha
+                            </th>
+
+                            <th style={{ border: "1px solid #ccc", padding: "5px" }}>
+                              EFB<br />$/ha
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {results.profit_results.map((row, index) => {
+                            const isMax = row.efb === maxEFB;
+                            const isTarget = targetNNum !== null && Number(row.n_rate) === targetNNum;
+                            const styleRow = {
+                              border: isTarget ? "2px solid #3b82f6" : "1px solid #ccc",
+                              padding: "5px"
+                            };
+
+                            return (
+                              <tr key={index} style={isMax ? { backgroundColor: "#d1ffd1", fontWeight: "bold" } : {}}>
+                                <td style={styleRow}>{row.n_rate}</td>
+                                <td style={styleRow}>{row.prob_gt_1000}</td>
+                                <td style={styleRow}>{row.prob_gt_1500}</td>
+                                <td style={styleRow}>{row.prob_gt_2000}</td>
+                                <td style={styleRow}>{row.prob_gt_2500}</td>
+                                <td style={styleRow}>{Number(row.expected_nrcf).toFixed(2)}</td>
+                                <td style={styleRow}>
+                                  {Number(row.efb).toFixed(2)} {isMax && "⭐"}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {results?.used_prices && (
+                      <div
+                        style={{
+                          marginTop: 16,
+                          border: "1px solid #e5e7eb",
+                          borderRadius: 8,
+                          padding: 12,
+                          background: "#fafafa"
+                        }}
+                      >
+                        <h3 style={{ marginTop: 0, marginBottom: 8 }}>Economic Assumptions Used</h3>
+
+                        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, fontSize: 13 }}>
+                          <div><strong>Corn price mean:</strong> {fmt(results?.used_prices?.yield_mean)}</div>
+                          <div><strong>Corn price std:</strong> {fmt(results?.used_prices?.yield_std)}</div>
+                          <div><strong>Urea cost mean:</strong> {fmt(results?.used_prices?.fert_mean)}</div>
+                          <div><strong>Urea cost std:</strong> {fmt(results?.used_prices?.fert_std)}</div>
+                        </div>
+
+                        <p style={{ marginTop: 10, fontSize: 12, opacity: 0.78 }}>
+                          The baseline profit tables and contour come from pre-computed backend distributions. These displayed
+                          values are informational only and do not rebuild the baseline results in the browser.
+                        </p>
+                      </div>
+                    )}
+
+                    {customCard && (
+                      <div
+                        style={{
+                          marginTop: 16,
+                          border: "1px solid #c7d2fe",
+                          borderRadius: 8,
+                          padding: 12,
+                          background: "#eef2ff"
+                        }}
+                      >
+                        <h3 style={{ marginTop: 0, marginBottom: 8 }}>Custom Profit @ your prices</h3>
+                        <p style={{ margin: 0 }}>
+                          Using pre-computed QP params (Y₀={results.qp_params.Y0}, Ymax={results.qp_params.Ymax}, Nymax={results.qp_params.Nymax}) and your inputs:
+                        </p>
+                        <ul style={{ marginTop: 8 }}>
+                          <li>Target N = <b>{customCard.N}</b> kg/ha</li>
+                          <li>Yield(N) = <b>{customCard.yld.toFixed(2)}</b> (units/ha)</li>
+                          <li>Corn price μ = <b>{customCard.price}</b>, Urea μ = <b>{customCard.cost}</b></li>
+                          <li>NRCF = <b>{customCard.nrcf.toFixed(2)}</b> $/ha (= Yield × Price − N × Cost)</li>
+                        </ul>
+                        <div style={{ fontSize: 12, opacity: 0.8 }}>
+                          This does <b>not</b> change the baseline tables; it is a quick single-point estimate at your chosen N and prices.
+                        </div>
+                      </div>
+                    )}
+                  </>
+                );
+              })() : (
+                <div style={{ padding: 12, background: "#fff4f4", border: "1px solid #f3c2c2", borderRadius: 6 }}>
+                  No valid match/profit rows found. Please adjust sliders and try again.
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ---------- Contour Modal ---------- */}
+      {showContourModal && zoomedContour && (
+        <div
+          onClick={closeContourModal}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.78)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 9999,
+            padding: 20,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              position: "relative",
+              maxWidth: "96vw",
+              maxHeight: "96vh",
+              background: "#fff",
+              borderRadius: 12,
+              padding: 12,
+              boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
+              overflow: "auto",
+            }}
+          >
+            <button
+              onClick={closeContourModal}
+              style={{
+                position: "absolute",
+                top: 10,
+                right: 10,
+                zIndex: 2,
+                border: "none",
+                background: "#111827",
+                color: "#fff",
+                borderRadius: 6,
+                padding: "8px 12px",
+                cursor: "pointer",
+              }}
+            >
+              Close
+            </button>
+
+            <img
+              src={`data:image/png;base64,${zoomedContour}`}
+              alt="Zoomed Probability Contour"
+              style={{
+                maxWidth: "92vw",
+                maxHeight: "90vh",
+                width: "auto",
+                height: "auto",
+                display: "block",
+                borderRadius: 8,
+                marginTop: 34,
+              }}
+            />
+          </div>
+        </div>
+      )}
+    </>
+  );
+};
+
+/* ---------- Small components ---------- */
+const SelectedInputsCard = ({
+  inline = false,
+  latitude,
+  longitude,
+  ACLAY,
+  SOM,
+  CHU,
+  AWDR,
+  previousCrop,
+  tillageType,
+  q
+}) => {
+  const style = {
+    ...cardStyle,
+    marginBottom: 12,
+    ...(inline ? { border: "1px solid #e5e7eb", background: "#fafafa" } : {})
+  };
+
+  return (
+    <div style={style}>
+      <h3 style={{ margin: 0, marginBottom: 8 }}>Selected Inputs</h3>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, fontSize: 12 }}>
+        <div><strong>Lat:</strong> {fmt(latitude)}</div>
+        <div><strong>Lng:</strong> {fmt(longitude)}</div>
+        <div><strong>ACLAY:</strong> {fmt(ACLAY, "%")}</div>
+        <div><strong>SOM:</strong> {fmt(SOM, "%")}</div>
+        <div><strong>CHU:</strong> {fmt(CHU)}</div>
+        <div><strong>AWDR:</strong> {fmt(AWDR)}</div>
+        <div><strong>Prev Crop:</strong> {previousCrop}</div>
+        <div><strong>Tillage:</strong> {tillageType}</div>
+        <div><strong>q:</strong> {q}</div>
+      </div>
+    </div>
+  );
+};
+
+const RunCard = ({ run, color, onRemove }) => {
+  const eonr = run?.eonr ?? "—";
+  const inx = run.inputs || {};
+
+  return (
+    <div
+      style={{
+        border: "1px solid #e5e7eb",
+        borderRadius: 10,
+        padding: "8px 10px",
+        marginBottom: 8,
+        background: "#ffffff"
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ width: 10, height: 10, borderRadius: 999, background: color }} />
+        <code style={{ opacity: 0.8, minWidth: 90 }}>{hhmmss(run.ts)}</code>
+
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+          <span style={chip("#e0f2fe", "#0c4a6e")}>q={inx.q ?? "?"}</span>
+          <span style={chip("#eef2ff", "#3730a3")}>ACLAY={fmt(inx.ACLAY, "%")}</span>
+          <span style={chip("#eef2ff", "#3730a3")}>SOM={fmt(inx.SOM, "%")}</span>
+          <span style={chip("#f1f5f9", "#0f172a")}>CHU={fmt(inx.CHU)}</span>
+          <span style={chip("#f1f5f9", "#0f172a")}>AWDR={fmt(inx.AWDR)}</span>
+          <span style={chip("#dcfce7", "#14532d")}>EONR={eonr}</span>
+
+          {run?.used_fallback ? (
+            <span style={chip("#fef3c7", "#92400e")}>
+              fallback d={run?.fallback_distance ?? "—"}
+            </span>
+          ) : run?.similarity != null ? (
+            <span style={chip("#ede9fe", "#5b21b6")}>
+              sim={Number(run.similarity).toFixed(4)}
+            </span>
+          ) : null}
+        </div>
+
+        <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+          <button
+            onClick={() => onRemove(run.id)}
+            style={{
+              padding: "4px 8px",
+              border: "1px solid #fecaca",
+              background: "#fff",
+              borderRadius: 6,
+              cursor: "pointer",
+              color: "#b91c1c"
+            }}
+          >
+            remove
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default App;
